@@ -1,0 +1,398 @@
+"""Async TCP collector for Douyu danmaku server.
+
+Connects to openbarrage.douyu.com:8601, logs in anonymously, joins the room
+group, sends heartbeats, and parses dgb / ssd messages into normalized events
+which are passed to an on_event callback.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Awaitable, Callable, Dict
+
+from . import protocol as proto
+
+log = logging.getLogger(__name__)
+
+DANMAKU_HOST = "danmuproxy.douyu.com"
+DANMAKU_PORT = 8601
+HEARTBEAT_INTERVAL = 45
+
+# 未识别 type 的 body 写到此文件供后续分析；每个 type 最多 _DIAG_SAMPLES 条样本
+_DIAG_LOG_PATH = Path(__file__).parent / "diag.log"
+_DIAG_SAMPLES = 5
+
+# Douyu splits chat across multiple "groups" on busy rooms; joining several
+# yields ~40% more chatmsg than the broadcast group alone (verified A/B).
+GIDS_TO_JOIN: tuple[int, ...] = (-9999, 1, 2, 3, 4, 5)
+
+# Source type strings (server) → our normalized 'kind'
+# Subscription type names confirmed via [diag] log:
+#   2026-05-08: dfobc 开通钻粉 (验证: 1580 鱼翅事件) / dfrbc 推测的续费版
+#   2026-05-09: odfpbc / rdfpbc — 另一种钻粉广播 (无 price 字段, 疑似赠送或活动型)
+# 贵族 anbc/rnewbc 仍未在本环境触发，保留占位。
+# 旧的 odfbc/rndfbc 在本环境从未触发已移除。
+_KIND_MAP = {
+    "dgb":             "gift",
+    "ssd":             "superchat",     # placeholder, may not actually fire
+    "comm_chatmsg":    "superchat",     # 高能弹幕 V2 — paid voice/text barrage
+    "chatmsg":         "chat",          # ephemeral, NOT persisted
+    "dfobc":           "subscription",  # 开通钻粉 (with price)
+    "dfrbc":           "subscription",  # 续费钻粉 (speculative)
+    "odfpbc":          "subscription",  # 开通钻粉 (no price; 赠送/活动型)
+    "rdfpbc":          "subscription",  # 续费钻粉 (no price)
+    "anbc":            "subscription",  # 开通贵族 (untested)
+    "rnewbc":          "subscription",  # 续费贵族 (untested)
+    "rec_barrage_hot": "hot_barrage",   # 斗鱼聚合的"N 人在说 XXX"热度帧 (ephemeral)
+    "oni":             "vip_info",      # 在线贵宾数推送 (vn 字段); 每 ~5s 一帧, ephemeral
+}
+
+# 贵族等级名 (per douyu-monitor: vue/src/global/utils/dydata/nobleData.js)
+_NOBLE_NAMES = {
+    1: "骑士", 2: "子爵", 3: "伯爵", 4: "公爵", 5: "国王",
+    6: "皇帝", 7: "诸侯",
+}
+
+OnEvent = Callable[[dict], Awaitable[None]]
+
+# Diagnostic: types that show up every second and would spam the log if surfaced.
+# Anything NOT in this set and NOT in _KIND_MAP gets a one-shot INFO log on
+# first sight, so when Douyu introduces a new event (e.g. 钻粉广播 type changes)
+# we can spot it without running sniff.py separately.
+_DIAG_NOISE = {
+    # 已知的高频协议噪音
+    "chatmsg", "uenter", "oun", "mrkl", "pingreq", "loginres",
+    "actFishing", "defense_tower_session", "synexp", "rtss_update",
+    "ranklist", "anchor_rank2505_change", "configscreen",
+    "blab", "online_noble_list", "rss", "noble_num_info", "frank",
+    # 2026-05-08 排查 diag.log 确认无价值或与现有信号重复:
+    "spbc",        # 跨房间大礼物广播 (drid 不是当前房间; 本房间的礼物 dgb 已覆盖)
+    "cthn",        # 跨房间彩色弹幕广播
+    "voice_trlt",  # 语音高能弹幕的 mp3 翻译广播; Phase 4 做 mp3 归档时再恢复
+    "upgrade",     # 用户等级升级
+    "tsboxb",      # 任务系统-宝箱事件 (rpt 是任务点不是鱼翅)
+    "tsgs",        # 任务系统-观众间礼物
+    # 2026-05-09 Phase 2 采样后追加:
+    "dfnum",            # 粉丝数变化通知
+    "srres",            # 系统响应/确认帧
+    "dyh_legend_seas",  # 主播大乱斗活动状态
+    "little_lucky_info", "pocketTips",  # 幸运/口袋活动
+    "fxdaychange",      # 活动每日重置
+    "anchor_rights",    # 主播权益变更
+    "rankup",           # 用户房间排名上升
+    "tsd",              # 任务完成通知
+    "rtss_complete",    # 任务奖励发放
+    "dfv2", "dfv2_pd_sw",  # 钻粉 v2 卡牌/段位
+    "growth_wel_banner",   # 用户成长欢迎横幅
+}
+
+
+class Collector:
+    def __init__(self, room_id: int, on_event: OnEvent, gift_catalog: Dict[int, dict] | None = None):
+        self.room_id = room_id
+        self.on_event = on_event
+        self.gift_catalog: Dict[int, dict] = gift_catalog or {}
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._unknown_counts: dict[str, int] = {}
+        self._diag_fp = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run_forever(), name=f"douyu-{self.room_id}")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._diag_fp:
+            try:
+                self._diag_fp.close()
+            except Exception:
+                pass
+            self._diag_fp = None
+
+    def _log_unknown(self, t: str, body: str) -> None:
+        n = self._unknown_counts.get(t, 0) + 1
+        self._unknown_counts[t] = n
+        if n == 1:
+            log.info("[diag] first-seen unknown type: %s, body[:200]: %s", t, body[:200])
+        if n > _DIAG_SAMPLES:
+            return
+        if self._diag_fp is None:
+            try:
+                fp = open(_DIAG_LOG_PATH, "a", encoding="utf-8", buffering=1)
+                if fp.tell() == 0:
+                    fp.write(
+                        "# Douyu unknown-type diag log\n"
+                        "# format: <ISO time>\\t<type>\\t<full body>\n"
+                        f"# up to {_DIAG_SAMPLES} samples per type per server process\n"
+                    )
+                self._diag_fp = fp
+            except OSError as e:
+                log.warning("diag log open failed: %s", e)
+                return
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self._diag_fp.write(f"{ts}\t{t}\t{body}\n")
+        except Exception as e:
+            log.warning("diag log write failed: %s", e)
+
+    async def _run_forever(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                await self._run_once()
+                backoff = 1.0  # reset on clean disconnect
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("collector error: %s; reconnect in %.1fs", e, backoff)
+            if self._stop.is_set():
+                return
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+    async def _run_once(self) -> None:
+        log.info("connecting to %s:%d for room %d", DANMAKU_HOST, DANMAKU_PORT, self.room_id)
+        reader, writer = await asyncio.open_connection(DANMAKU_HOST, DANMAKU_PORT)
+        try:
+            writer.write(proto.login_req(self.room_id))
+            for gid in GIDS_TO_JOIN:
+                writer.write(proto.join_group(self.room_id, gid))
+            await writer.drain()
+            log.info("login + joingroup(%s) sent", list(GIDS_TO_JOIN))
+
+            hb_task = asyncio.create_task(self._heartbeat_loop(writer))
+            try:
+                await self._read_loop(reader)
+            finally:
+                hb_task.cancel()
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _heartbeat_loop(self, writer: asyncio.StreamWriter) -> None:
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                writer.write(proto.heartbeat())
+                await writer.drain()
+        except (asyncio.CancelledError, ConnectionError):
+            return
+
+    async def _read_loop(self, reader: asyncio.StreamReader) -> None:
+        buf = bytearray()
+        while not self._stop.is_set():
+            chunk = await reader.read(8192)
+            if not chunk:
+                log.info("server closed connection")
+                return
+            buf.extend(chunk)
+            for _msg_type, body in proto.iter_frames(buf):
+                kv = proto.parse_kv(body)
+                t = kv.get("type")
+                if t in _KIND_MAP:
+                    await self._dispatch(t, kv, body)
+                elif t and t not in _DIAG_NOISE:
+                    self._log_unknown(t, body)
+
+    async def _dispatch(self, t: str, kv: dict, raw: str) -> None:
+        kind = _KIND_MAP[t]
+        ts_ms = int(time.time() * 1000)
+        if kind == "gift":
+            gfid = _to_int(kv.get("gfid"))
+            pid = _to_int(kv.get("pid"))
+            count = _to_int(kv.get("gfcnt")) or 1
+            # name resolution: gfn (in payload) > catalog[gfid] > catalog[pid] > placeholder
+            name = kv.get("gfn") or None
+            meta_gfid = self.gift_catalog.get(gfid, {}) if gfid else {}
+            meta_pid = self.gift_catalog.get(pid, {}) if pid else {}
+            if not name:
+                name = meta_gfid.get("name") or meta_pid.get("name")
+            if not name:
+                name = f"礼物#{gfid}" if gfid else (f"礼物#pid={pid}" if pid else "未知礼物")
+            price = meta_gfid.get("price_yuchi") or meta_pid.get("price_yuchi")
+            event = {
+                "ts": ts_ms,
+                "room_id": self.room_id,
+                "kind": "gift",
+                "uid": kv.get("uid") or kv.get("src_uid"),
+                "nickname": kv.get("nn") or kv.get("src_ncnm"),
+                "gift_id": gfid if gfid else pid,
+                "gift_name": name,
+                "count": count,
+                "price_yuchi": price,
+                "content": None,
+                "raw": raw,
+            }
+        elif kind == "superchat" and t == "comm_chatmsg":
+            # 高能弹幕 V2: outer carries vrid/btype/cprice/cet, inner chatmsg@= holds user data.
+            # Inner uses level-1 escaping: @S→/ @A→@ — already handled by parse_kv in the outer pass.
+            inner_body = kv.get("chatmsg") or ""
+            inner = proto.parse_kv(inner_body) if inner_body else {}
+            cprice_centi = _to_int(kv.get("cprice")) or _to_int(kv.get("crealPrice")) or 0
+            # btype=pandora 等"零价值高能"复用了 comm_chatmsg 协议但 cprice=0
+            # (潘多拉宝箱抽中礼物的全房广播，那笔钱在买宝箱时已计入 dgb)。
+            # 丢弃以避免重复信号。
+            if cprice_centi <= 0:
+                return
+            event = {
+                "ts": ts_ms,
+                "room_id": self.room_id,
+                "kind": "superchat",
+                "uid": inner.get("uid") or kv.get("uid"),
+                "nickname": inner.get("nn"),
+                "gift_id": None,
+                "gift_name": kv.get("btype") or "高能弹幕",  # e.g. 'voiceDanmu' / '高能弹幕'
+                "count": 1,
+                "price_yuchi": (cprice_centi / 100.0) if cprice_centi else None,
+                "content": inner.get("txt"),
+                "color": None,
+                "raw": raw,
+            }
+        elif kind == "superchat":  # legacy ssd path
+            event = {
+                "ts": ts_ms,
+                "room_id": self.room_id,
+                "kind": "superchat",
+                "uid": kv.get("suid") or kv.get("senduid") or kv.get("uid"),
+                "nickname": kv.get("snic") or kv.get("nn"),
+                "gift_id": None,
+                "gift_name": None,
+                "count": 1,
+                "price_yuchi": _to_int(kv.get("sdpr")),
+                "content": kv.get("content") or kv.get("trd"),
+                "color": None,
+                "raw": raw,
+            }
+        elif kind == "subscription":
+            # 钻粉广播有四种 type，字段大同小异：
+            #   dfobc / dfrbc  — 自购，含 price (RMB 分；÷10 = 鱼翅)
+            #   odfpbc / rdfpbc — 无 price (赠送/活动型)
+            # 共用字段: uid / nick / mn(月数) / rrid(目标主播房间)
+            if t in ("dfobc", "dfrbc", "odfpbc", "rdfpbc"):
+                rrid = _to_int(kv.get("rrid"))
+                if rrid and rrid != self.room_id:
+                    return  # cross-room broadcast
+                is_open = t in ("dfobc", "odfpbc")
+                price_cents = _to_int(kv.get("price")) or 0
+                price_yuchi = price_cents / 10.0 if price_cents else None
+                mn = _to_int(kv.get("mn")) or 1
+                label = "开通钻粉" if is_open else "续费钻粉"
+                if mn > 1:
+                    label = f"{label} ×{mn} 月"
+                event = {
+                    "ts": ts_ms,
+                    "room_id": self.room_id,
+                    "kind": "subscription",
+                    "uid": kv.get("uid"),
+                    "nickname": kv.get("nick") or kv.get("nn"),
+                    "gift_id": None,
+                    "gift_name": label,
+                    "count": 1,
+                    "price_yuchi": price_yuchi,
+                    "content": kv.get("bn") or None,
+                    "color": None,
+                    "raw": raw,
+                }
+            else:  # anbc / rnewbc — 贵族开通/续费 (untested branch)
+                drid = _to_int(kv.get("drid"))
+                if drid and drid != self.room_id:
+                    return
+                nl = _to_int(kv.get("nl"))
+                label = {
+                    "anbc":   f"开通{_NOBLE_NAMES.get(nl or 0, '贵族')}",
+                    "rnewbc": f"续费{_NOBLE_NAMES.get(nl or 0, '贵族')}",
+                }[t]
+                event = {
+                    "ts": ts_ms,
+                    "room_id": self.room_id,
+                    "kind": "subscription",
+                    "uid": kv.get("uid"),
+                    "nickname": kv.get("nick") or kv.get("unk") or kv.get("nn"),
+                    "gift_id": nl,
+                    "gift_name": label,
+                    "count": 1,
+                    "price_yuchi": None,
+                    "content": None,
+                    "raw": raw,
+                }
+        elif kind == "vip_info":
+            # type@=oni: 在线贵宾推送, vn=贵宾数, un=同义副本
+            # ephemeral, 不入库, 仅广播
+            vn = _to_int(kv.get("vn"))
+            if vn is None:
+                return
+            event = {
+                "ts": ts_ms,
+                "room_id": self.room_id,
+                "kind": "vip_info",
+                "vip_count": vn,
+                "uid": None, "nickname": None, "gift_id": None,
+                "gift_name": None, "count": None, "price_yuchi": None,
+                "content": None, "color": None, "raw": None,
+            }
+        elif kind == "hot_barrage":
+            # rec_barrage_hot.content 是 JSON: {"bg": 完整原句, "hot": 热点关键词, "showTime":10, "total": N}
+            # 与"N 人在说 hot"对应。ephemeral，不入库。
+            try:
+                info = json.loads(kv.get("content") or "{}")
+            except Exception:
+                return
+            event = {
+                "ts": ts_ms,
+                "room_id": self.room_id,
+                "kind": "hot_barrage",
+                "uid": None,
+                "nickname": None,
+                "gift_id": None,
+                "gift_name": info.get("hot") or "",   # 复用字段：热点关键词
+                "count": _to_int(info.get("total")) or 1,
+                "price_yuchi": None,
+                "content": info.get("bg") or "",      # 复用字段：完整原句
+                "color": None,
+                "raw": None,
+            }
+        else:  # chatmsg — always ephemeral. col/nl mean noble/diamond-fan styling, NOT SuperChat.
+            col_raw = kv.get("col") or ""
+            try:
+                color = int(col_raw) or None
+            except (TypeError, ValueError):
+                color = None
+            event = {
+                "ts": ts_ms,
+                "room_id": self.room_id,
+                "kind": "chat",
+                "uid": kv.get("uid"),
+                "nickname": kv.get("nn"),
+                "gift_id": None,
+                "gift_name": None,
+                "count": 1,
+                "price_yuchi": None,
+                "content": kv.get("txt"),
+                "color": color,  # passed through for chat-panel tinting only
+                "raw": None,
+            }
+        try:
+            await self.on_event(event)
+        except Exception as e:
+            log.exception("on_event handler failed: %s", e)
+
+
+def _to_int(v) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# 运行时数据
+events.db
+events.db-shm
+events.db-wal
+events.db.bak-*
+diag.log
+
+# 环境
+.venv/
+.env
