@@ -13,7 +13,8 @@ class RepositoryContractTests(unittest.TestCase):
     def test_readme_uses_clone_and_package_entrypoint(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("git clone", readme)
-        self.assertIn("cd hyacinth-sentry", readme)
+        self.assertIn("hyacinth-sentry-douyu.git", readme)
+        self.assertIn("cd hyacinth-sentry-douyu", readme)
         self.assertIn("python -m uvicorn hyacinth_sentry.server:app", readme)
 
     def test_repo_contains_local_screenshots(self) -> None:

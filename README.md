@@ -51,8 +51,8 @@
 ### 1. 拉代码并安装依赖
 
 ```powershell
-git clone https://github.com/LEorEu/hyacinth-sentry.git
-cd hyacinth-sentry
+git clone https://github.com/LEorEu/hyacinth-sentry-douyu.git
+cd hyacinth-sentry-douyu
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
